@@ -1,0 +1,1199 @@
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch import cat
+#from unet.unet_model import UNet
+# from OptosLoader import OptosLoader
+import numpy as np
+from numpy import asarray
+import time as t
+from matplotlib import pyplot as plt
+import sys
+import getopt
+import os
+import pandas as pd
+from torch.utils.data import Dataset
+from scipy.io import loadmat
+import scipy.ndimage as ndi
+# from helper import transform_all, clipT, StandardiseT, DataAug, RandomCrop
+from PIL import Image
+from torchvision.transforms import ToTensor, CenterCrop as CentreCrop
+from torchvision.transforms import ToTensor, functional as TF, ToPILImage as ToIm
+import cv2
+from skimage.util import random_noise
+from skimage.morphology import skeletonize, label, area_opening, disk, rectangle as rect
+from scipy.ndimage import convolve
+from skimage.exposure import equalize_adapthist as ahe, rescale_intensity as ri, equalize_hist as eh, adjust_gamma as ag, adjust_log as al
+from skimage.measure import label
+
+
+torch.set_default_tensor_type(torch.FloatTensor)
+device = 'cuda' #'cpu' #change to 'cuda' when torch decides to work
+class OptosLoader(Dataset):
+    '''This class the data into the network by fetching several items to form a batch for each step in each epoch. It also
+    inherits from the torch.utils.Dataset class.
+
+    Function __init__: Initialises the variables to be used in the class such as all the image paths and masks
+
+    Function __len__: This determines the number of samples to be used in each of the training, validation and test sets to tell
+    the network how many samples to train/validate/test on.
+
+    Function __getitem__: This fetches a random sample from the image and mask paths and reads in image as an array and converts
+    it to a torch tensor.'''
+
+    def __init__(self, set_type, patch_height=128, patch_width=128, root_folder = 'data', cali_only = False, cali_twice = False):
+        '''
+        Initialise OptosLoader class
+        params:
+            set_type: string; train, test, or val
+            patch_height, patch_width: int, 2^n; height and width of training patches
+            Cali_mode: can be 'none', 'include', or 'only'
+
+        '''
+        #initialisation
+
+        #get list of files in the folders
+        self.image_paths = []
+        self.mask_paths = []
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+        self.set_type = set_type
+        '''
+        for root, dirs, files in os.walk("./data/images"):
+            if files == []:
+                continue
+            for f in sorted(files):
+                if 'green.png' in f:
+                    self.image_paths.append(os.path.join(root, f))
+
+        for root, dirs, files in os.walk("./data/labels"):
+            if files == []:
+                continue
+            for f in sorted(files):
+                if '.mat' in f:
+                    self.mask_paths.append(os.path.join(root, f))
+        '''
+        #save image filenames
+        # if 'LoG' not in root_folder:
+        for i, f in enumerate(os.walk('%s/%s/images'%(root_folder, set_type))):
+            if cali_only and 'img' not in f[0]:
+                continue
+            if f[1] != []:
+                continue
+
+            for ff in f[2]:
+                if '.db' in ff:
+                    continue
+                if cali_twice and 'img' in f[0]:
+                    r = 2
+                else:
+                    r = 1
+                for x in range(r):
+                    fpath = f[0] + '/' + ff
+                    self.image_paths.append(fpath)
+
+        # else: 
+            # for i, f in enumerate(os.walk('%s/%s/images'%(root_folder, set_type))):
+                # if cali_only and 'img' not in f[0]:
+                    # continue
+                # if f[1] != []:
+                    # continue
+
+                # for ff in f[2]:
+                    # if '.mat'  not in ff:
+                        # continue
+                    # if cali_twice and 'img' in f[0]:
+                        # r = 2
+                    # else:
+                        # r = 1
+                    # for x in range(r):
+                        # fpath = f[0] + '/' + ff
+                        # self.image_paths.append(fpath)
+
+        #save label filenames
+        for i, f in enumerate(os.walk('%s/%s/labels'%(root_folder, set_type))):
+            if cali_only and 'img' not in f[0]:
+                continue
+            if f[1] != []:
+                continue
+
+            for ff in f[2]:
+                if '.db' in ff:
+                    continue
+                if cali_twice and 'img' in f[0]:
+                    r = 2
+                else:
+                    r = 1
+                for x in range(r):
+                    fpath = f[0] + '/' + ff
+                    self.mask_paths.append(fpath)
+
+        #sanity check
+        #print(self.image_paths)
+        if len(self.mask_paths) != len(self.image_paths):
+            print("Error in data acquisition. Please check the data folder and try again")
+            print(len(self.mask_paths), len(self.image_paths))
+            sys.exit()
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        #Generates data at index idx
+        # print(self.image_paths[idx], self.mask_paths[idx])
+        if '.jpg' not in self.image_paths[idx]:          #was if '.mat' not in self.image etc..
+            X = Image.open(self.image_paths[idx])
+        else:
+            X = loadmat(self.image_paths[idx])
+            X = Image.fromarray(X['img'][:,:,(0, 1, 4)])
+        mask = Image.open(self.mask_paths[idx])
+
+        #X = StandardiseT(X)
+        #X = X - X.mean()
+
+        if self.set_type == 'train':
+            X, mask = DataAug(X, mask, patch_height = self.patch_height, patch_width = self.patch_width)
+        elif self.set_type == 'val':
+            X = CentreCrop(256)(X)
+            mask = np.array(CentreCrop(256)(mask))
+        else:
+            # print(self.image_paths[idx], self.mask_paths[idx])
+            mask = np.array(mask)
+
+        X = Image.fromarray(np.array(X))
+        X = ToTensor()(X).to(device)[:3]
+        # plt.imshow(mask)
+        # plt.show()
+        y = ToTensor()(mask[:,:,0:2] > 128)*1.0
+        #print(self.image_paths[idx])
+        # for i in range(3):
+            # plt.imshow(y[i])
+            # plt.show()
+
+        y_ = (((y[0] == 0)*1 + (y[1] == 0)*1 + (y[2] == 0)*1).unsqueeze(0) == 3)*1.
+        #y = (y[0]+y[1]+y[2]).unsqueeze(0)
+        # plt.imshow(X.detach().cpu().numpy().transpose(1, 2, 0))
+        # plt.show()
+        y = torch.cat([y, y_], axis=0).float().to(device)
+
+
+        #print(y.size())
+        #print(y.size())
+        #print(X.size())
+
+        return X, y
+
+#ds = OptosLoader('train')
+#ds_sample = ds[4]
+#plt.imshow(ds_sample[0][0])
+#plt.figure()
+#print(ds_sample[1][2].max())
+#plt.imshow(ds_sample[1][2])
+#plt.colorbar()
+
+
+def read_img(path):
+    '''
+    Read in the image as an array
+
+    path: image path from directory.'''
+    img = Image.open(path)
+    img_array = asarray(img)
+    img = img.resize(size=(img_array.shape[1], img_array.shape[0]))
+    return asarray(img)
+
+def transform_all(img, mask, h=128, w=128):
+    # performs transform on image and mask. Takes PIL Image as input, outputs torch tensor
+    tp = [Image.FLIP_LEFT_RIGHT, Image.FLIP_TOP_BOTTOM, Image.ROTATE_180]
+
+    width, height = img.size
+
+    #crop randomly
+    x_crop = np.random.randint(0, height-h)
+    y_crop = np.random.randint(0, width-w)
+    img_out = img.crop((y_crop, x_crop, y_crop+w, x_crop+h))
+    #print(x_crop)
+    mask_out = mask.crop((y_crop, x_crop, y_crop+w, x_crop+h))
+
+    #rotate randomly
+    rot = np.random.randint(0, len(tp))
+    img_out = img_out.transpose(tp[rot])
+    #print(rot)
+    mask_out = mask_out.transpose(tp[rot])
+
+    img_out = ToTensor()(img_out)#.unsqueeze(0)/255
+    mask_out = ToTensor()(np.array(mask_out) > 0)#.unsqueeze(0)
+    bg_out = ~mask_out
+
+    mask_out = cat([mask_out, bg_out], axis=0)
+
+    return [img_out, mask_out]
+
+def DSC(y_pred, y_true):
+    #calculate Dice similarity coefficient of output
+    recall = np.sum(np.logical_and(y_pred, y_true))
+    recall /= np.sum(np.array(y_true, dtype = np.float32))
+
+    precision = np.sum(np.logical_and(y_pred, y_true))/np.sum(np.array(y_pred, dtype = np.float32))
+
+    dsc = 2*precision*recall/(precision+recall)
+
+    return dsc
+
+def OutputColour(mask, truemask, im):
+    # Show colout image
+    if mask.shape[1] != 4:
+        print("Error")
+        return 0
+
+    mask = TransformMask(mask)
+    truemask = TransformMask(truemask)
+
+    plt.figure()
+    plt.imshow(mask)
+
+def TransformMask(mask):
+    #Now defunct, turns mask into colour image
+    mask = np.array(mask[0, 1:], dtype = np.uint8)
+    mask2 = np.zeros([128, 256, 3])
+
+    mask2[:,:,0] = mask[0]
+    mask2[:,:,1] = mask[2]
+    mask2[:,:,2] = mask[1]
+
+    return mask2
+
+def SegmentImageWindows(image, model, patchSize = 128, use_cuda = True, exponent = 1, use_sigmoid = False, standardise = False, use_softmax = True, verbose = False, channels = 4):
+    # Segment an image which is of the wrong size to segment in its entirety in one go.
+    # Segments large images and tiles together the middle sections of them (otherwise you get edge artefacts)
+    h, w = image[0,0].size()
+    image = image.to('cuda')
+    model_out = torch.zeros([1, channels, h, w])
+    patchNumH = int(np.floor(h/(patchSize/2)))
+    patchNumW = int(np.floor(w/(patchSize/2)))
+    if not use_cuda: model.cpu()
+    if patchSize > max([h, w]):
+        patchScore = model(image.to(device) if use_cuda else image.cpu())
+        model_out = patchScore
+    else:
+        #print(patchNumH)
+        t0 = t.time()
+        for hh in range(1, patchNumH + 1):
+            for ww in range(1, patchNumW + 1):
+                # Define image bounding boxes
+                if hh == 1:
+                    hRange = [0,patchSize]; #Patch to segment
+                    hSubRange = [0,round(0.75*patchSize)] #area within large image to segment (smaller than the patch)
+                    hPatchIdx = [0,round(0.75*patchSize)] #area within the patch to put into the larger image
+                elif hh == patchNumH:
+                    hRange = [round(h - patchSize), h];
+                    hSubRange = [h-round(0.75*patchSize), h];
+                    hPatchIdx = [round(0.25*patchSize), patchSize];
+                else:
+                    hRange = [round((hh-1)*(patchSize/2)),round((hh-1)*(patchSize/2)+patchSize)];
+                    hSubRange = [round((hh-1)*(patchSize/2)+(patchSize/4)),round((hh-1)*(patchSize/2)+(3*patchSize/4))];
+                    hPatchIdx = [round(patchSize/4),round(3*patchSize/4)];
+
+                if ww == 1:
+                    wRange = [0,patchSize]; #Patch to segment
+                    wSubRange = [0,round(0.75*patchSize)] #area within large image to segment (smaller than the patch)
+                    wPatchIdx = [0,round(0.75*patchSize)] #area within the patch to put into the larger image
+                elif ww == patchNumW:
+                    wRange = [round(w - patchSize), w];
+                    wSubRange = [w-round(0.75*patchSize), w];
+                    wPatchIdx = [round(0.25*patchSize), patchSize];
+                else:
+                    wRange = [round((ww-1)*(patchSize/2)),round((ww-1)*(patchSize/2)+patchSize)];
+                    wSubRange = [round((ww-1)*(patchSize/2)+(patchSize/4)),round((ww-1)*(patchSize/2)+(3*patchSize/4))];
+                    wPatchIdx = [round(patchSize/4),round(3*patchSize/4)];
+
+                # Segment image patches
+                patch = image[:,:,hRange[0]:hRange[1], wRange[0]:wRange[1]];
+                #print(patch.size())
+                patchScore = model(patch.to(device) if use_cuda else patch.cpu())
+                #print(patchScore.size())
+                #print(model_out.shape)
+                model_out[:, :, hSubRange[0]:hSubRange[1], wSubRange[0]:wSubRange[1]] = patchScore[:, :, hPatchIdx[0]:hPatchIdx[1], wPatchIdx[0]:wPatchIdx[1]].detach().cpu();
+    if verbose:
+        print("Pixel-wise segmentation took %.2fs"%(t.time() - t0))
+    if use_softmax:
+        return F.softmax(model_out, dim=1).cuda().detach().numpy()
+    elif use_sigmoid:
+        return(sigmoid(model_out, exponent=exponent))
+    elif standardise:
+        return(StandardiseT(model_out))
+    else:
+        return model_out
+
+def IsRGB(image):
+    # Return boolean and image, image is 2D if grayscale or has colour channel if colour
+    # Not actually used in the end
+    if len(np.shape(image)) == 2:
+        return [True, image]
+    elif np.shape(image)[2] == 1:
+        return [True, image[:,:,0]]
+    else:
+        return [False, image]
+
+def sigmoid(imgin, exponent = 1.):
+    return 1/(1+np.exp(-exponent * imgin))
+
+def clip(arr): #numpy clip
+    return (arr-np.min(arr))/(np.max(arr) - np.min(arr))
+
+def clipT(arr): #torch clip
+    return (arr-arr.min())/(arr.max() - arr.min())
+
+def Standardise(img): #numpy standardise
+    return((img-np.mean(img))/np.std(img))
+
+def StandardiseT(img): #torch standardise
+    return((img-img.mean())/img.std())
+
+def DataAug_old(img, mask, patch_height = 128, patch_width = 128, max_shear = 0.3, min_scale = 0.5, max_scale = 1.5, max_rot = np.pi, flip_chance = 0.5):
+    # Data augmentation for six-channel images
+    # img is an mxnx6 numpy array
+    # return random crop from the mask and image
+    img = np.array(img)
+    mask = np.array(mask)
+
+    transformation_matrix = RandomAffineTransform()
+
+    img = ndi.affine_transform(img, transformation_matrix, mode = 'mirror')
+    mask = ndi.affine_transform(mask, transformation_matrix, mode = 'mirror')
+
+    img, mask = RandomCrop(img, mask, patch_height=patch_height, patch_width=patch_width)
+
+    #img = np.float32(img) * ((np.random.rand(1)*0.1) + 0.95) #randomly change intensity
+
+    return([img, mask])
+
+def DataAug(img, mask, patch_height = 128, patch_width = 128, max_shear = 0.3, min_scale = 0.5, max_scale = 1.5, max_rot = np.pi, flip_chance = 0.5):
+    # Data augmentation for six-channel images
+    # img is an mxnx6 numpy array
+    # return random crop from the mask and image
+    #img = np.array(img)
+    #mask = np.array(mask, dtype = np.uint8)*255
+
+    max_shear = 30
+    min_scale = 0.8
+    max_scale = 1.2
+    max_rot = 1804
+    #generate random affine transformations
+    tf = {}
+    rnd = np.random.rand(3)
+    rnd[0:2] = 2*rnd[0:2] - 1
+    tf['angle'] = rnd[0]*max_rot #rotation
+    tf['shear'] = rnd[1]*max_shear #shear
+    tf['scale'] = min_scale + (rnd[2]*(max_scale - min_scale)) #scale
+    tf['translate'] = [0, 0]
+
+    img = np.array(TF.affine(img, **tf))
+    mask = np.array(TF.affine(mask, **tf))
+
+    img, mask = RandomCrop(img, mask, patch_height=patch_height, patch_width=patch_width)
+
+    histchange = np.random.rand(1)
+    if histchange[0] < 0.15:
+        img = np.array(ahe(img)*255, dtype = np.uint8)
+    elif histchange[0] < 0.3:
+        img = np.array(ri(img)*255, dtype = np.uint8)
+    elif histchange[0] < 0.45:
+        img = np.array(eh(img)*255, dtype = np.uint8)
+    elif histchange[0] < 0.6:
+        img = np.array(ag(img, np.random.uniform(0.5, 1.8))*255, dtype = np.uint8)
+    elif histchange[0] < 0.75:
+        img = np.array(al(img)*255, dtype = np.uint8)
+
+    #print(img)
+
+    return([img, mask])
+
+def RandomAffineTransform(max_shear = np.pi/4, min_scale = 0.5, max_scale = 1.5, max_rot = np.pi, flip_chance = 0.5):
+    #generate a random affine transformation matrix
+    rnd = np.random.rand(3)
+    rnd[0] *= max_rot
+    rnd[1] *= max_shear
+    rnd[2] = min_scale + (rnd[2]*(max_scale - min_scale))
+
+    rotmat = np.array([[np.cos(rnd[0]), -np.sin(rnd[0]), 0], [np.sin(rnd[0]), np.cos(rnd[0]), 0], [0, 0, 1]])
+    #shearmat = np.array([[1, np.tan(rnd[1]), 0], [0, 1, 0], [0, 0, 1]])
+    scalemat = np.array([[1/rnd[2], 0, 0], [0, 1/rnd[2], 0], [0, 0, 1]])
+
+    trmat = np.matmul(scalemat, rotmat)
+    #trmat = np.matmul(shearmat, trmat)
+
+    return trmat
+
+def RandomCrop(img, mask, patch_height = 128, patch_width = 128):
+
+    height, width = np.shape(img)[0:2]
+
+    #crop randomly
+    x_crop = np.random.randint(0, height-patch_height)
+    y_crop = np.random.randint(0, width-patch_width)
+
+    img_crop = img[x_crop:x_crop+patch_height, y_crop:y_crop+patch_width]
+    mask_crop = mask[x_crop:x_crop+patch_height, y_crop:y_crop+patch_width]
+
+    return([img_crop, mask_crop])
+
+def check_state_dict_size(fpath):
+    #load state dict
+    max_channels = 0
+    sd = torch.load(fpath)
+    kernel_size = 0
+    check_ks = True
+    for key in sd:
+        #print(len(sd[key].size()))
+        if len(sd[key].size()) == 0:
+            continue
+        elif len(sd[key].size()) == 1:
+            max_channels = max(max_channels, sd[key].size()[0])
+        elif len(sd[key].size()) == 4:
+            max_channels = max(max_channels, sd[key].size()[0])
+            kernel_size = max(kernel_size, sd[key].size()[3])
+
+    print("Kernel size is %i, max channels is %i"%(kernel_size, max_channels))
+    return([kernel_size, max_channels])
+
+def check_if_filled(dil, binary):
+    dbin = np.sum(np.clip(dil, 0., 1.))
+    bbin = np.sum(np.clip(binary, 0., 1.))
+    same = bbin - dbin
+    # print(same)
+    changed = np.abs(same) > 1
+    return(changed)
+
+def ClassifyVesselSegments(binary_image, av_image, fast = True, use_cv2 = True, verbose = False):
+
+    if not use_cv2 and fast:
+        print("Fast mode only supports cv2. Please set use_cv2 to True or fast to False to continue")
+        return(0)
+
+    test_binary = np.clip(binary_image, 0., 1.)
+    if len(test_binary.shape) == 3:
+        test_binary = test_binary[:,:,0]
+    test_av = np.divide(av_image, np.max(av_image))
+
+    #test_binary = test_binary[1950:2050, 1950:2050]
+
+    skel_test = skeletonize(test_binary > 0)*1.
+    #print(skel_test.shape)
+    convkernelsize = 5
+    convkernel = np.ones([convkernelsize, convkernelsize])
+
+    branch_points = (convolve(skel_test, convkernel) > convkernelsize)*1.
+    #print(np.max(branch_points), np.min(branch_points), np.max(skel_test), np.min(skel_test))
+
+    skel_test -= branch_points
+    skel_test = np.clip(skel_test, 0., 1.)
+    #skel_test = area_opening(skel_test, area_threshold = 3, connectivity = 2)
+
+    skel_test = label(skel_test)
+    #plt.imshow(skel_test, cmap = 'jet')
+    #plt.show()
+    r = 2
+
+    dil_test = np.copy(skel_test)
+    #print(strel.shape)
+    changed = True
+    counter = 0
+    t00 = t.time()
+    while changed:
+
+        counter += 1
+        #if counter > 3:
+        #	r+= 1
+        if verbose:
+            print('Loop', counter)
+        t0 = t.time()
+        dil_test_prev = np.copy(dil_test)
+        dilations = 0
+
+        #'''
+        if not fast:
+            strel = disk(r, dtype = np.uint8)
+            for i in range(1, np.max(skel_test)+1):
+                idx = np.array(dil_test == i, dtype = np.float32 )
+                idx_dil = dil_test == 0
+                if not use_cv2:
+                    dil_test[idx_dil] = binary_dilation(idx, strel)[idx_dil]*i #this took 910 seconds
+                    #dil_test[idx_dil] = bd(idx, strel, mask = test_binary)[idx_dil] #very, very marginally slower
+                else:
+                    dil_temp = cv2.dilate(np.float32(idx), strel)
+                    dil_test[idx_dil] = dil_temp[idx_dil]*i
+                dilations += 1
+        #'''
+        else:
+            strel = disk(2, dtype = np.uint8)
+            dil_test = cv2.dilate(np.float32(dil_test), strel)
+        dil_test = dil_test*test_binary
+        t1 = t.time()
+        changed = check_if_filled(dil_test, test_binary)
+        if counter == 100:
+            changed = False
+        if verbose:
+            print('Loop %i took %.2fs'%(counter, t1 - t0))
+
+    if verbose:
+        print("Dilations took %.2fs"%(t.time()-t00))
+
+    av_seg_out = np.zeros(test_av.shape)
+    #print(np.max(dil_test), np.min(dil_test))
+    t0 = t.time()	
+    for i in range(1, int(np.max(dil_test)) + 1):
+        ves_seg = np.array(dil_test == i, dtype = np.bool_)
+        artery_prob = np.sum(ves_seg*test_av[:,:,0])
+        unknown_prob = np.sum(ves_seg*test_av[:,:,1])
+        vein_prob = np.sum(ves_seg*test_av[:,:,2])
+
+        if artery_prob == np.max([artery_prob, vein_prob, unknown_prob]):
+            av_seg_out[:,:,0] += 255.*ves_seg
+        elif vein_prob == np.max([artery_prob, vein_prob, unknown_prob]):
+            av_seg_out[:,:,2] += 255.*ves_seg
+        else:
+            av_seg_out[:,:,1] += 255.*ves_seg #unknown
+    if verbose:
+        print("Classifying segments took %.2fs"%(t.time()-t0))
+
+    return(av_seg_out)
+
+def GetBoundingBox(image):
+    bin_im = np.where(image > 0)
+    #print(bin_im)
+    if len(bin_im[0]) == 0:
+        return( [-1]*4 )
+    top = np.min(bin_im[0])
+    bottom = np.max(bin_im[0])
+    left = np.min(bin_im[1])
+    right = np.max(bin_im[1])
+    return([top, bottom, left, right])
+
+def test_dsc(model, test_generator, use_cuda = True, write_im = False, im_name = "test"):
+    #calculated DSC on the test set
+    dsc = []
+    for idx, batch in enumerate(test_generator):
+        X_test, y_test = batch
+        X_test = X_test.float()
+        y_test = y_test.float()
+        #print(y_test.size())
+        y_pred = SegmentImageWindows(X_test,
+                               model,
+                               use_cuda = use_cuda,
+                               use_sigmoid = False,
+                               use_softmax = True,
+                               patchSize = 128,
+                               channels = 4)
+
+        #print(y_pred.shape)
+        y_pred_array = np.amax(y_pred[0], axis = 0)
+        #print(y_pred_array.shape, y_pred[0,1].shape)
+        #for i in range(np.max(y_pred_array) + 1):
+        for i in range(4):
+            y_pred[0, i, y_pred[0,i] != y_pred_array] = 0
+        #print(y_pred_array)
+        y_pred[y_pred > 0] = 255
+        #print(y_pred)
+
+
+        #prediction = F.softmax(y_pred.cpu(), dim=1).detach().numpy()>0.5
+        ground_truth = (y_test.cuda()).detach().numpy()
+        #print(y_pred)
+        #print(np.shape(prediction), np.shape(ground_truth))
+        #print('Accuracy on batch {}: {}\n'.format(idx, round(np.mean(scores),3)))
+        dsc.append(round(DSC(y_pred[0,0:3] > 0, ground_truth[0,0:3] > 0),5))
+        y_pred = np.array(y_pred[0, 0:3] > 0, dtype = np.uint8).transpose(1, 2, 0) * 255
+        ground_truth = np.array(ground_truth[0, 0:3] > 0, dtype = np.uint8).transpose(1, 2, 0) * 255
+        testout = Image.fromarray(y_pred)
+        origimg = ToIm()(X_test[0].cuda().detach())
+        gtout = Image.fromarray(ground_truth)
+        testout.save("%spred_%i.png"%(im_name, idx))
+        gtout.save("%struth_%i.png"%(im_name, idx))
+        origimg.save("%soriginal_%i.png"%(im_name, idx))
+
+    return(dsc)
+
+def test_conn_dsc(model, test_generator, use_cuda = True, write_im = False, im_name = "test"):
+    #calculated DSC on the test set
+    dsc = []
+    conn = []
+    for idx, batch in enumerate(test_generator):
+        X_test, y_test = batch
+        X_test = X_test.float()
+        y_test = y_test.float()
+        #print(y_test.size())
+        y_pred = SegmentImageWindows(X_test,
+                               model,
+                               use_cuda = use_cuda,
+                               use_sigmoid = False,
+                               use_softmax = True,
+                               patchSize = 128,
+                               channels = 4)
+
+        #print(y_pred.shape)
+        y_pred_array = np.amax(y_pred[0], axis = 0)
+        #print(y_pred_array.shape, y_pred[0,1].shape)
+        #for i in range(np.max(y_pred_array) + 1):
+        for i in range(4):
+            y_pred[0, i, y_pred[0,i] != y_pred_array] = 0
+        #print(y_pred_array)
+        y_pred[y_pred > 0] = 255
+        #print(y_pred)
+
+
+        #prediction = F.softmax(y_pred.cpu(), dim=1).detach().numpy()>0.5
+        ground_truth = (y_test.cuda()).detach().numpy()
+        #print(y_pred)
+        #print(np.shape(prediction), np.shape(ground_truth))
+        #print('Accuracy on batch {}: {}\n'.format(idx, round(np.mean(scores),3)))
+        dsc.append(round(DSC(y_pred[0,0:3] > 0, ground_truth[0,0:3] > 0),5))
+        conn.append(connectivity(np.sum(y_pred[0, 0:3] > 0, axis = 0), np.sum(ground_truth[0, 0:3] > 0, axis = 0)))
+        y_pred = np.array(y_pred[0, 0:3] > 0, dtype = np.uint8).transpose(1, 2, 0) * 255
+        ground_truth = np.array(ground_truth[0, 0:3] > 0, dtype = np.uint8).transpose(1, 2, 0) * 255
+        testout = Image.fromarray(y_pred)
+        origimg = ToIm()(X_test[0].cuda().detach())
+        gtout = Image.fromarray(ground_truth)
+        if write_im:
+            testout.save("%spred_%i.png"%(im_name, idx))
+            gtout.save("%struth_%i.png"%(im_name, idx))
+            origimg.save("%soriginal_%i.png"%(im_name, idx))
+    return(dsc, conn)
+
+def connectivity(ypred, ytrue):
+    #print(ytrue)
+    skeltrue0 = skeletonize(ytrue > 0)*1.
+    branchestrue = branches(skeltrue0)
+    skeltrue = np.clip(skeltrue0*1. - branchestrue*1., 0., 1., dtype = np.float32)
+    truelbl = label(skeltrue)
+    # plt.imshow(truelbl)
+    # plt.show()
+
+    skelpred0 = skeletonize(ypred > 0)*1.
+    branchespred = branches(skelpred0)
+    skelpred = np.clip(skelpred0*1. - branchespred*1., 0., 1., dtype = np.float32)
+    predlbl = label(skelpred)
+
+
+    Sp = np.max(truelbl)
+    Sg = np.max(predlbl)
+    alpha = 0.05;
+    L = np.sum(skeltrue0)
+    Smax = alpha*L
+
+    numerator = np.abs(Sp - Sg, dtype = np.float32)
+
+    if numerator > Smax or Smax == 0:
+        metric = 0.
+    else:
+        metric = 1. - (numerator/Smax)
+    # print(metric)
+    return(metric)
+
+def branches(skel_im, ksize = 3):
+    filt = np.ones([ksize, ksize])
+    im_filt = convolve(skel_im, filt, mode = 'constant', cval = 0)
+    skel_im_filt = np.logical_and(np.logical_xor(skel_im, im_filt != ksize), skel_im)
+    branching_points = np.logical_and(skel_im, np.logical_not(skel_im_filt))
+    return(branching_points)
+
+
+
+if True:
+    torch.set_default_tensor_type(torch.FloatTensor)
+
+    """ Parts of the U-Net model """
+
+class DoubleConv(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
+
+    def __init__(self, in_channels, out_channels, mid_channels=None, kernel_size = 5):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=kernel_size, padding=int((kernel_size-1)/2)),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=kernel_size, padding=int((kernel_size-1)/2)),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
+
+    def __init__(self, in_channels, out_channels, kernel_size = 5):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels, kernel_size=kernel_size)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+
+class Up(nn.Module):
+    """Upscaling then double conv"""
+
+    def __init__(self, in_channels, out_channels, bilinear=True, kernel_size = 5):
+        super().__init__()
+
+        # if bilinear, use the normal convolutions to reduce the number of channels
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2, kernel_size=kernel_size)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels , in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels, kernel_size=kernel_size)
+
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # input is CHW
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        # if you have padding issues, see
+        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
+        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+    """ Full assembly of the parts to form the complete network """
+
+# from .unet_parts import *
+
+
+class UNet(nn.Module):
+	def __init__(self, n_channels, n_classes, bilinear=True, kernel_size = 5, mc = 512):
+		super(UNet, self).__init__()
+		self.n_channels = n_channels
+		self.n_classes = n_classes
+		self.bilinear = bilinear
+
+		self.inc = DoubleConv(n_channels, mc//16, kernel_size = kernel_size)
+		self.down1 = Down(mc//16, mc//8, kernel_size = kernel_size)
+		self.down2 = Down(mc//8, mc//4, kernel_size = kernel_size)
+		self.down3 = Down(mc//4, mc//2, kernel_size = kernel_size)
+		factor = 2 if bilinear else 1
+		self.down4 = Down(mc//2, mc // factor, kernel_size = kernel_size)
+		self.up1 = Up(mc, mc//2 // factor, bilinear, kernel_size = kernel_size)
+		self.up2 = Up(mc//2, mc//4 // factor, bilinear, kernel_size = kernel_size)
+		self.up3 = Up(mc//4, mc//8 // factor, bilinear, kernel_size = kernel_size)
+		self.up4 = Up(mc//8, mc//16, bilinear, kernel_size = kernel_size)
+		self.outc = OutConv(mc//16, n_classes)
+
+	def forward(self, x):
+		x1 = self.inc(x)
+		x2 = self.down1(x1)
+		x3 = self.down2(x2)
+		x4 = self.down3(x3)
+		x5 = self.down4(x4)
+		x = self.up1(x5, x4)
+		x = self.up2(x, x3)
+		x = self.up3(x, x2)
+		x = self.up4(x, x1)
+		logits = self.outc(x)
+		return logits
+    
+def initiate_training(	use_cuda = True, 
+            max_channels = 1024, 
+            dense = False, 
+            batch_size = 20, 
+            root_folder = None, ):
+
+
+    use_cuda = torch.cuda.is_available()
+
+    height = 128
+    width = 128
+    mc = max_channels
+    #Initialise the models
+    model_unet =  UNet(			n_channels = 3, 
+                                n_classes = 4,
+                                kernel_size = 3, 
+                                mc = max_channels, 
+                                bilinear = False)
+
+
+    num_epochs = [6000, 6000, 2000]
+    learn_r = [1e-4, 6e-5, 1e-5]
+    save = True
+
+    results = {}
+    if root_folder == None:
+        root_folders = ['data']
+        # root_folders = ['data_open', 'data_open2']
+    else:
+        root_folders = [root_folder]
+
+    for root_folder in root_folders:
+        #set up a dict t osave results in an easily viewable form
+        results[root_folder] = {}
+        results[root_folder]['model'] = []
+        results[root_folder]['mean_test_dsc'] = []
+        results[root_folder]['mean_test_connectivity'] = []
+        # Define batch sizes for training, validation and test sets
+        train_batch_size = batch_size
+        valid_batch_size = 10
+        test_batch_size = 1
+
+        #generator parameters
+        train_params = {'batch_size': train_batch_size,
+                    'shuffle': True,
+                    'num_workers': 0,
+                    'generator': torch.Generator(device='cuda')}
+
+        valid_params = {'batch_size': valid_batch_size,
+                    'shuffle': False,
+                    'num_workers': 0}
+
+        test_params = {'batch_size': 1,
+                    'shuffle': False,
+                    'num_workers': 0}
+
+
+        #dataloader = data.DataLoader(...generator=torch.generator(device='cuda'))
+        
+        #get generators
+        
+        train_dataloader = device = 'cuda'
+        train_dataloader = OptosLoader(set_type='train', 
+                                        patch_height = height, 
+                                        patch_width = width, 
+                                        # Cali_mode = 'include')
+                                        root_folder = root_folder)
+        train_generator = device = 'cuda'
+        train_generator = DataLoader(train_dataloader, **train_params)
+        valid_dataloader = device = 'cuda'
+        valid_dataloader = OptosLoader(set_type='val', 
+                                        patch_height = height, 
+                                        patch_width = width, 
+                                        # Cali_mode = 'include')
+                                        root_folder = root_folder)
+        valid_generator = device = 'cuda'
+        valid_generator = DataLoader(valid_dataloader, **valid_params)
+
+        test_dataloader = device = 'cuda'
+        test_dataloader = OptosLoader(set_type='test', 
+                                        patch_height = height, 
+                                        patch_width = width,
+                                        # Cali_mode = 'include')
+                                        root_folder = root_folder)
+        test_generator = device = 'cuda'
+        test_generator = DataLoader(test_dataloader, **test_params)
+
+
+
+        dsc_best_overall = 0.0
+        models = []; model_type = []
+        # models.append(model_nestediter); model_type.append('IterNetPlusPlus')
+        # models.append(model_nestedunet); model_type.append('UNetPlusPlus')
+        models.append(model_unet); model_type.append('UNet')
+        # models.append(model_iternet); model_type.append('IterNet')
+        # models.append(model_denseunet); model_type.append('Dense_UNet')
+        for n, model in enumerate(models):
+            history = None
+            if use_cuda:
+                model.to(device)
+            for i in range(len(num_epochs)):
+
+                optimizer = optim.Adam(params = model.parameters(), lr=learn_r[i])
+                history, model_best, dsc_best = train_model(model if i == 0 else model_best,
+                                                        train_generator,
+                                                        valid_generator,
+                                                        optimizer,
+                                                        num_epochs=num_epochs[i],
+                                                        history=history,
+                                                        use_cuda = use_cuda)
+
+
+                if test:
+                    model = model_best
+                    dsc_best_overall = dsc_best
+                if dsc_best > dsc_best_overall: #take model checkpoints, use best
+                    model = model_best
+                    dsc_best_overall = dsc_best
+
+            save_info(model, root_folder, model_type[n], history, base_folder = 'Results')
+
+            dsc, conn = test_conn_dsc(model, test_generator, use_cuda = True)
+
+            results[root_folder]['model'].append(model_type[n])
+            results[root_folder]['mean_test_dsc'].append(np.mean(dsc))
+            results[root_folder]['mean_test_connectivity'].append(np.mean(conn))
+
+            df = pd.DataFrame(results)
+            df.to_csv('Results/Results.csv', index = False)
+            if save:
+                plt.figure()
+                plt.plot(history['train_loss'], label = "Training")
+                plt.plot(history['valid_loss'], label = "Validation")
+                plt.xlabel("Epoch")
+                plt.ylabel("Loss")
+                plt.legend()
+                plt.ylim([0, 1])
+                plt.savefig('Training Loss.png')
+                torch.save(model.state_dict(), 'model_trained_%s_dict.pt'%(model_type[n]))
+                torch.save(model, 'model_trained_%s_full.pt'%(model_type[n]))
+                f = open('training_history_%s.csv'%model_type[n], 'w+')
+                f.write('epoch,train_dsc,train_loss,valid_dsc,valid_loss\n')
+                for i in range(sum(num_epochs)):
+                    f.write('%i,%.3f,%.3f,%.3f,%.3f\n'%(i,
+                    history['train_dsc'][i],
+                    history['train_loss'][i],
+                    history['valid_dsc'][i],
+                    history['valid_loss'][i]
+                    )
+                    )
+                f.close()
+
+            # print("Saved file")
+            # summary(model, input_size = (3, height, width))
+            print('FOR SET %s'%model_type[n].upper())
+            print('Best DSC on the validation set was', dsc_best_overall)
+            dsc_test_all = test_dsc(model.to(device), 
+                                    test_generator, 
+                                    use_cuda = use_cuda, 
+                                    write_im  = save, 
+                                    im_name = '%s_out/test_im_'%model_type[n])
+            dsc_test = round(np.mean(dsc_test_all), 5)
+
+            print('DSC on the test set is', dsc_test)
+            f = open('results_%s.txt'%model_type[n], 'w+')
+            f.write('Best DSC on the validation set was %.5f, \nDSC on the test set is %.5f\nDSCs on all images:\n'%(dsc_best_overall, dsc_test))
+            for dsc in dsc_test_all:
+                f.write('%.6f, '%dsc)
+            f.close()
+
+            model.apply(reset_weights)
+
+def train_model(model,
+    train_generator,
+    valid_generator,
+    optimizer,
+    num_epochs = 1,
+    history = None,
+    use_cuda = True):
+    # Function which actually performs the training loop
+    #use_cuda = torch.cuda.is_available()
+
+    #record outputs
+    if history == None:
+        history = {'train_dsc': [], 'train_loss': [],'valid_dsc': [], 'valid_loss': []}
+
+    best_validation_dsc = 0.0
+    epoch_count = []
+    # model_best = model
+    for epoch in range(num_epochs):
+        print('Epoch %d...\n' % (epoch+1))
+        train_loss = []
+        train_dsc = []
+        valid_loss = []
+        valid_dsc = []
+
+        #print('\tTraining...')
+        model.train()
+        t_t0 = t.time()
+        # Loop through iteratively generated training data using batch size
+        for idx, batch in enumerate(train_generator):
+            # Initialise the gradient for each epoch
+            optimizer.zero_grad()
+            # Feed data through feedforward pass
+            #print('Performing feedforward pass for batch {}'.format(idx))
+            X_train, y_train = batch
+            X_train = X_train#.float()
+            y_train = y_train#.float()
+            #if use_cuda: bmap = bmap.to(device)
+
+            #bmap_idx = torch.cat([bmap, bmap, bmap, torch.zeros(bmap.size())], axis = 1).cpu().detach()
+
+            # Calculate loss
+            if use_cuda:
+                y_pred = model(X_train.to(device)).to(device)
+                # print(y_pred.size(), y_train.size())
+                loss = nn.BCEWithLogitsLoss().to(device)(y_pred[:,0:3].to(device), y_train[:,0:3].to(device))
+            else:
+                y_pred = model(X_train)
+                loss = nn.BCEWithLogitsLoss()(y_pred[:,0], y_train[:,0])
+            train_loss.append(loss.item())
+
+            prediction = F.softmax(y_pred.cuda(), dim=1).detach().numpy()>0.5
+            ground_truth = (y_train.cuda()).detach().numpy()
+            #print(np.shape(prediction), np.shape(ground_truth))
+            #print('Accuracy on batch {}: {}\n'.format(idx, round(np.mean(scores),3)))
+            train_dsc.append(round(DSC(prediction[:, 0:3], ground_truth[:, 0:3]),5))
+
+            # Calculate backpropogation
+            loss.backward()
+
+            # Move a step using the optimizer
+            optimizer.step()
+        #torch.cuda.empty_cache()
+        t_v0 = t.time()
+
+        torch.cuda.empty_cache()
+
+        #print('\n\n\tValidating...')
+        model.eval()
+        # Determine loss on validation set through iteratively generating validation data using batch size
+        for idx, batch in enumerate(valid_generator):
+            #print('Performing feedforward pass for batch {}'.format(idx))
+            # Run data through feedforward pass
+            X_valid, y_valid = batch
+            X_valid = X_valid.float().to(device) if use_cuda else X_valid.float()
+            y_valid = y_valid.float().to(device) if use_cuda else y_valid.float()
+
+            # Calculate loss
+
+            if use_cuda:
+                y_pred = model(X_valid).to(device)
+                loss = nn.BCEWithLogitsLoss().to(device)(y_pred[:,0].to(device), y_valid[:,0].to(device))
+            else:
+                y_pred = model(X_valid)
+                loss = nn.BCEWithLogitsLoss()(y_pred[:,0:3], y_valid[:,0:3])
+            valid_loss.append(loss.item())
+
+            # Calculate DSC
+            prediction = F.softmax(y_pred.cuda(), dim=1).detach().numpy()>0.5
+            ground_truth = (y_valid.cuda()).detach().numpy()
+            #print('Accuracy on batch {}: {}\n'.format(idx, round(np.mean(scores),3)))
+            valid_dsc.append(round(DSC(prediction[:, 0:3], ground_truth[:, 0:3]),5))
+
+        torch.cuda.empty_cache()
+        t_v1 = t.time()
+
+        # Calculate mean scores in batch
+        t_tf = round(t_v0 - t_t0,3)
+        t_vf = round(t_v1 - t_v0,3)
+        tf = round(t_v1 - t_t0,3)
+        mean_train_loss = round(np.mean(train_loss),5)
+        mean_train_dsc = round(np.mean(train_dsc),5)
+        mean_valid_loss = round(np.mean(valid_loss),5)
+        mean_valid_dsc = round(np.mean(valid_dsc),5)
+
+        if mean_valid_dsc > best_validation_dsc:
+            best_validation_dsc = mean_valid_dsc
+            model_best = model
+
+        # Store results
+        history['train_dsc'].append(mean_train_dsc)
+        history['train_loss'].append(mean_train_loss)
+        history['valid_dsc'].append(mean_valid_dsc)
+        history['valid_loss'].append(mean_valid_loss)
+
+        # Output loss for training and validation at each epoch
+        print('Time: {} \t Training time: {} \t Validation time: {}'.format(tf, t_tf, t_vf))
+        print('Epoch {}: \t training dsc: {} \t validation dsc: {}'.format((epoch+1),mean_train_dsc, mean_valid_dsc))
+        print('          \t training loss: {}\t validation loss: {}\n'.format(mean_train_loss, mean_valid_loss))
+
+        # if epoch%500 == 0:
+            # print("Saving model checkpoint\n\n")
+            # torch.save(model.state_dict(), 'model_trained_Nested_IterNet_checkpoint_dict.pt')
+
+
+
+    return([history, model_best, best_validation_dsc])
+
+## takes in a module and applies the specified weight initialization
+def reset_weights(m):
+    '''Takes in a module and initializes all linear layers with weight
+       values taken from a normal distribution.'''
+
+    classname = m.__class__.__name__
+    # for every Linear layer in a model
+    if classname.find('Conv2d') != -1 or classname.find('ConvTranspose2d') != -1:
+        y = m.in_channels
+    # m.weight.data shoud be taken from a normal distribution
+        m.weight.data.normal_(0.0,1/np.sqrt(y))
+    # m.bias.data should be 0
+        m.bias.data.fill_(0)
+
+def save_info(model, root_folder, model_type, history, base_folder = 'Results'):
+    #Function to save all the relevant information into neat folders
+    #make folder:
+    fold_name = '%s/%s_%s'%(base_folder, model_type, root_folder)
+    if not os.path.exists(fold_name):
+        os.makedirs(fold_name)
+    os.chdir(fold_name)
+    print(os.getcwd())
+
+    #save model
+    torch.save(model.state_dict(), 'model_trained_%s_dict.pt'%(model_type))
+    torch.save(model, 'model_trained_%s_full.pt'%(model_type))
+
+    #figures for loss
+    plt.figure()
+    plt.plot(history['train_loss'], label = "Training")
+    plt.plot(history['valid_loss'], label = "Validation")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.ylim([0, 1])
+    plt.savefig('Training Loss.png')
+
+    #save a csv of training progress
+    f = open('training_history_%s.csv'%model_type, 'w+')
+    f.write('epoch,train_dsc,train_loss,valid_dsc,valid_loss\n')
+    for i in range(len(history['train_dsc'])):
+        f.write('%i,%.3f,%.3f,%.3f,%.3f\n'%(i,
+        history['train_dsc'][i],
+        history['train_loss'][i],
+        history['valid_dsc'][i],
+        history['valid_loss'][i]
+        )
+        )
+    f.close()
+
+    #save the output of the test images
+    test_dataloader = OptosLoader(set_type='test', 
+                                        patch_height = 0, 
+                                        patch_width = 0,
+                                        root_folder = '../../%s'%root_folder)
+
+    test_params = {'batch_size': 1,
+                'shuffle': False,
+                'num_workers': 0}									
+    test_generator = DataLoader(test_dataloader, **test_params)
+    if not os.path.exists('test_out'):
+        os.makedirs('test_out')
+    # print(os.getcwd())
+    dsc_test_all, connectivity_test_all = test_conn_dsc(model.to(device), 
+                            test_generator, 
+                            use_cuda = True, 
+                            write_im  = True, 
+                            im_name = './test_out/test_im_')
+
+    #save DSC and connectivity
+    # savemat('test_dsc.mat', {'dsc': dsc_test_all})
+    f = open('mean_results.txt', 'w+')
+    print(connectivity_test_all)
+    f.write('DSC on the training set was %.5f and connectivity was %.5f'%(np.mean(dsc_test_all), np.mean(connectivity_test_all)))
+    f.close()
+    # savemat('test_conn.mat', {'connectivity': connectivity_test_all})
+
+    #return to current working directory
+    os.chdir('../..')
+    print(os.getcwd())
+
+initiate_training()
